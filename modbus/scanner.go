@@ -9,6 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/goburrow/modbus"
@@ -42,7 +46,8 @@ type ScanRequest struct {
 	DelayMs          int      `json:"delay_ms"`           // delay between batches
 }
 
-func (r *ScanRequest) applyDefaults() {
+// ApplyDefaults fills zero-value fields with sensible defaults.
+func (r *ScanRequest) ApplyDefaults() {
 	if r.Mode == "" {
 		r.Mode = "tcp"
 	}
@@ -111,13 +116,15 @@ type ScanSummary struct {
 	Static       int `json:"static"`
 }
 
-type clientConn struct {
+// ClientConn wraps a modbus.Client with its closer and device label.
+type ClientConn struct {
 	Client modbus.Client
 	Close  func()
 	Device string
 }
 
-func newClient(req ScanRequest) (*clientConn, error) {
+// NewClient creates a Modbus client (TCP or RTU) based on the request mode.
+func NewClient(req ScanRequest) (*ClientConn, error) {
 	switch req.Mode {
 	case "rtu":
 		if req.SerialPort == "" {
@@ -134,7 +141,7 @@ func newClient(req ScanRequest) (*clientConn, error) {
 		if err := handler.Connect(); err != nil {
 			return nil, fmt.Errorf("connect serial %s: %w", req.SerialPort, err)
 		}
-		return &clientConn{
+		return &ClientConn{
 			Client: modbus.NewClient(handler),
 			Close:  func() { handler.Close() },
 			Device: fmt.Sprintf("rtu:%s@%d", req.SerialPort, req.BaudRate),
@@ -149,7 +156,7 @@ func newClient(req ScanRequest) (*clientConn, error) {
 		if err := handler.Connect(); err != nil {
 			return nil, fmt.Errorf("connect %s: %w", addr, err)
 		}
-		return &clientConn{
+		return &ClientConn{
 			Client: modbus.NewClient(handler),
 			Close:  func() { handler.Close() },
 			Device: addr,
@@ -159,10 +166,10 @@ func newClient(req ScanRequest) (*clientConn, error) {
 
 // Scan runs a full scan against a Modbus device (TCP or RTU).
 func Scan(req ScanRequest) (*ScanResult, error) {
-	req.applyDefaults()
+	req.ApplyDefaults()
 	start := time.Now()
 
-	conn, err := newClient(req)
+	conn, err := NewClient(req)
 	if err != nil {
 		return nil, err
 	}
@@ -228,11 +235,11 @@ func scanRegisters(client modbus.Client, regType string, start, end, batchSize u
 			count = end - addr + 1
 		}
 
-		data, err := readBatch(client, regType, addr, count)
+		data, err := ReadBatch(client, regType, addr, count)
 		scanned += int(count)
 
 		if err == nil && len(data) > 0 {
-			values := bytesToUint16(data)
+			values := BytesToUint16(data)
 			for i, v := range values {
 				results = append(results, RawRegister{
 					Address:   addr + uint16(i),
@@ -254,7 +261,7 @@ func scanRegisters(client modbus.Client, regType string, start, end, batchSize u
 func resample(client modbus.Client, registers []RawRegister, delayMs int) {
 	for i := range registers {
 		reg := &registers[i]
-		data, err := readBatch(client, reg.Type, reg.Address, 1)
+		data, err := ReadBatch(client, reg.Type, reg.Address, 1)
 		if err == nil && len(data) >= 2 {
 			val := binary.BigEndian.Uint16(data[:2])
 			reg.RawValues = append(reg.RawValues, val)
@@ -265,7 +272,8 @@ func resample(client modbus.Client, registers []RawRegister, delayMs int) {
 	}
 }
 
-func readBatch(client modbus.Client, regType string, addr, count uint16) ([]byte, error) {
+// ReadBatch reads a batch of registers by type.
+func ReadBatch(client modbus.Client, regType string, addr, count uint16) ([]byte, error) {
 	switch regType {
 	case "holding":
 		return client.ReadHoldingRegisters(addr, count)
@@ -280,7 +288,8 @@ func readBatch(client modbus.Client, regType string, addr, count uint16) ([]byte
 	}
 }
 
-func bytesToUint16(data []byte) []uint16 {
+// BytesToUint16 converts raw bytes to uint16 slice (big-endian).
+func BytesToUint16(data []byte) []uint16 {
 	n := len(data) / 2
 	values := make([]uint16, n)
 	for i := 0; i < n; i++ {
@@ -293,4 +302,48 @@ func bytesToUint16(data []byte) []uint16 {
 func Float32FromPair(hi, lo uint16) float32 {
 	bits := uint32(hi)<<16 | uint32(lo)
 	return math.Float32frombits(bits)
+}
+
+// ListSerialPorts returns available serial port paths for the current OS.
+func ListSerialPorts() []string {
+	var patterns []string
+	switch runtime.GOOS {
+	case "darwin":
+		patterns = []string{"/dev/cu.usb*", "/dev/cu.wchusbserial*", "/dev/tty.usb*", "/dev/tty.wchusbserial*"}
+	case "linux":
+		patterns = []string{"/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyS*"}
+	default:
+		patterns = []string{}
+	}
+
+	var ports []string
+	seen := make(map[string]bool)
+	for _, p := range patterns {
+		matches, _ := filepath.Glob(p)
+		for _, m := range matches {
+			if !seen[m] {
+				seen[m] = true
+				ports = append(ports, m)
+			}
+		}
+	}
+
+	if runtime.GOOS == "linux" {
+		var filtered []string
+		for _, p := range ports {
+			if strings.HasPrefix(p, "/dev/ttyS") {
+				if info, err := os.Stat(p); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+					filtered = append(filtered, p)
+				}
+			} else {
+				filtered = append(filtered, p)
+			}
+		}
+		ports = filtered
+	}
+
+	if ports == nil {
+		ports = []string{}
+	}
+	return ports
 }
