@@ -3,6 +3,9 @@ package auth
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
@@ -30,13 +33,13 @@ type JWTConfig struct {
 
 type jwksCache struct {
 	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
+	keys    map[string]crypto.PublicKey
 	fetched time.Time
 	ttl     time.Duration
 }
 
 var cache = &jwksCache{
-	keys: make(map[string]*rsa.PublicKey),
+	keys: make(map[string]crypto.PublicKey),
 	ttl:  1 * time.Hour,
 }
 
@@ -60,7 +63,11 @@ func RequireJWT(cfg JWTConfig) func(http.Handler) http.Handler {
 			}
 
 			token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
-				if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+				switch t.Method.(type) {
+				case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
+					// Logto Cloud signs with ES384 (EC P-384); self-hosted Logto may use RS256.
+					// Accept both so this middleware works against either deployment.
+				default:
 					return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 				}
 				kid, _ := t.Header["kid"].(string)
@@ -111,7 +118,7 @@ func GetUserID(ctx context.Context) string {
 	return id
 }
 
-func getKey(jwksURL, kid string) (*rsa.PublicKey, error) {
+func getKey(jwksURL, kid string) (crypto.PublicKey, error) {
 	cache.mu.RLock()
 	if key, ok := cache.keys[kid]; ok && time.Since(cache.fetched) < cache.ttl {
 		cache.mu.RUnlock()
@@ -128,11 +135,14 @@ type jwksResponse struct {
 type jwkKey struct {
 	Kid string `json:"kid"`
 	Kty string `json:"kty"`
+	Crv string `json:"crv"`
 	N   string `json:"n"`
 	E   string `json:"e"`
+	X   string `json:"x"`
+	Y   string `json:"y"`
 }
 
-func fetchJWKS(jwksURL, kid string) (*rsa.PublicKey, error) {
+func fetchJWKS(jwksURL, kid string) (crypto.PublicKey, error) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
@@ -152,14 +162,23 @@ func fetchJWKS(jwksURL, kid string) (*rsa.PublicKey, error) {
 		return nil, fmt.Errorf("decode JWKS: %w", err)
 	}
 
-	newKeys := make(map[string]*rsa.PublicKey)
+	newKeys := make(map[string]crypto.PublicKey)
 	for _, k := range jwks.Keys {
-		if k.Kty != "RSA" {
+		var (
+			pub crypto.PublicKey
+			err error
+		)
+		switch k.Kty {
+		case "RSA":
+			pub, err = parseRSAKey(k)
+		case "EC":
+			pub, err = parseECKey(k)
+		default:
+			slog.Warn("skip JWKS key with unsupported kty", "kid", k.Kid, "kty", k.Kty)
 			continue
 		}
-		pub, err := parseRSAKey(k)
 		if err != nil {
-			slog.Warn("skip JWKS key", "kid", k.Kid, "error", err)
+			slog.Warn("skip JWKS key", "kid", k.Kid, "kty", k.Kty, "error", err)
 			continue
 		}
 		newKeys[k.Kid] = pub
@@ -187,5 +206,32 @@ func parseRSAKey(k jwkKey) (*rsa.PublicKey, error) {
 	return &rsa.PublicKey{
 		N: new(big.Int).SetBytes(nBytes),
 		E: int(new(big.Int).SetBytes(eBytes).Int64()),
+	}, nil
+}
+
+func parseECKey(k jwkKey) (*ecdsa.PublicKey, error) {
+	var curve elliptic.Curve
+	switch k.Crv {
+	case "P-256":
+		curve = elliptic.P256()
+	case "P-384":
+		curve = elliptic.P384()
+	case "P-521":
+		curve = elliptic.P521()
+	default:
+		return nil, fmt.Errorf("unsupported EC curve: %q", k.Crv)
+	}
+	xBytes, err := base64.RawURLEncoding.DecodeString(k.X)
+	if err != nil {
+		return nil, fmt.Errorf("decode x: %w", err)
+	}
+	yBytes, err := base64.RawURLEncoding.DecodeString(k.Y)
+	if err != nil {
+		return nil, fmt.Errorf("decode y: %w", err)
+	}
+	return &ecdsa.PublicKey{
+		Curve: curve,
+		X:     new(big.Int).SetBytes(xBytes),
+		Y:     new(big.Int).SetBytes(yBytes),
 	}, nil
 }
