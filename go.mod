@@ -1,6 +1,7 @@
 module github.com/seikaikyo/go-common
 
 go 1.26.1
+toolchain go1.26.7
 
 require (
 	github.com/go-chi/cors v1.2.2 // indirect
