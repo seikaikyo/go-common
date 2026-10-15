@@ -71,7 +71,7 @@ userID := auth.GetUserID(r.Context())
 
 ### modbus
 
-Modbus 暫存器掃描與型別推測，供 go-modbus-scanner 等工具使用。
+Modbus 暫存器掃描與型別推測，供 go-edge-gateway 的裝置掃描功能使用。
 
 - `Scan(req ScanRequest) (*ScanResult, error)`：依設定掃描暫存器區段
 - `Analyze(raws []RawRegister) []AnalyzedRegister`：分析掃描結果，推測數值範圍、是否動態、float32 配對與可能類別

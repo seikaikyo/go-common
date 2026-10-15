@@ -1,7 +1,7 @@
 // Package modbus provides Modbus TCP/RTU register scanning and type inference.
 //
-// Extracted from go-modbus-scanner. Used by go-modbus-scanner, go-edge-gateway,
-// and go-ot-security for protocol probing.
+// Extracted from go-modbus-scanner, which is now merged into go-edge-gateway.
+// Used by go-edge-gateway (internal/scan) for device discovery.
 package modbus
 
 import (
