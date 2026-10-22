@@ -19,6 +19,6 @@ dashai 生態系 Go 服務共用的套件庫，沒有可執行檔、沒有部署
 
 ## 開發
 
-- Go 版本照 `go.mod`（go 1.26.1，toolchain go1.26.7）
+- Go 版本照 `go.mod`（go 1.26.1，toolchain go1.26.10）
 - 驗證：`go build ./...`、`go vet ./...`。目前沒有測試檔
 - 這是公開 repo，不放本機路徑、帳號、金鑰；README 的 Logto 網址是公開的租戶端點
