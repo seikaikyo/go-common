@@ -32,18 +32,23 @@ type JWTConfig struct {
 }
 
 type jwksCache struct {
-	mu      sync.RWMutex
-	keys    map[string]crypto.PublicKey
-	fetched time.Time
-	ttl     time.Duration
+	mu        sync.RWMutex
+	keys      map[string]crypto.PublicKey
+	fetched   time.Time
+	attempted time.Time
+	ttl       time.Duration
 }
+
+// jwksMinRefetch caps JWKS requests to one per interval, whatever the tokens
+// presented (unknown kid, expired cache or a failing Logto).
+const jwksMinRefetch = time.Minute
 
 var cache = &jwksCache{
 	keys: make(map[string]crypto.PublicKey),
 	ttl:  1 * time.Hour,
 }
 
-// RequireJWT validates Logto-issued RS256 JWT tokens.
+// RequireJWT validates Logto-issued JWT tokens (ES384 on Logto Cloud, RS256 self-hosted).
 func RequireJWT(cfg JWTConfig) func(http.Handler) http.Handler {
 	jwksURL := strings.TrimRight(cfg.LogtoEndpoint, "/") + "/oidc/jwks"
 	expectedIssuer := strings.TrimRight(cfg.LogtoEndpoint, "/") + "/oidc"
@@ -73,21 +78,9 @@ func RequireJWT(cfg JWTConfig) func(http.Handler) http.Handler {
 				kid, _ := t.Header["kid"].(string)
 				return getKey(jwksURL, kid)
 			}, parseOpts...)
-
-			// Key rotation retry
-			if err != nil {
-				cache.mu.Lock()
-				cache.fetched = time.Time{}
-				cache.mu.Unlock()
-
-				token, err = jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
-					if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
-						return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-					}
-					kid, _ := t.Header["kid"].(string)
-					return getKey(jwksURL, kid)
-				}, parseOpts...)
-			}
+			// No refetch-and-retry here: an unknown kid already triggers a refetch
+			// inside getKey, and refetching on any failure let every bad token
+			// cost a request to Logto.
 
 			if err != nil || !token.Valid {
 				response.Err(w, http.StatusUnauthorized, "invalid token")
@@ -149,17 +142,32 @@ func fetchJWKS(jwksURL, kid string) (crypto.PublicKey, error) {
 	if key, ok := cache.keys[kid]; ok && time.Since(cache.fetched) < cache.ttl {
 		return key, nil
 	}
+	// Within the refetch interval, or when the fetch fails, keep using the
+	// keys already held rather than locking every user out.
+	stale := func(cause error) (crypto.PublicKey, error) {
+		if key, ok := cache.keys[kid]; ok {
+			return key, nil
+		}
+		return nil, cause
+	}
+	if time.Since(cache.attempted) < jwksMinRefetch {
+		return stale(fmt.Errorf("kid %q not found in JWKS", kid))
+	}
+	cache.attempted = time.Now()
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(jwksURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch JWKS: %w", err)
+		return stale(fmt.Errorf("fetch JWKS: %w", err))
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return stale(fmt.Errorf("fetch JWKS: status %d", resp.StatusCode))
+	}
 
 	var jwks jwksResponse
 	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		return nil, fmt.Errorf("decode JWKS: %w", err)
+		return stale(fmt.Errorf("decode JWKS: %w", err))
 	}
 
 	newKeys := make(map[string]crypto.PublicKey)
@@ -182,6 +190,9 @@ func fetchJWKS(jwksURL, kid string) (crypto.PublicKey, error) {
 			continue
 		}
 		newKeys[k.Kid] = pub
+	}
+	if len(newKeys) == 0 {
+		return stale(fmt.Errorf("JWKS has no usable keys"))
 	}
 
 	cache.keys = newKeys
